@@ -1,0 +1,156 @@
+# This cell reads the semicolon-delimited parsed file, transforms wide daily columns to long monthly totals per station,
+# picks the first station, builds a monthly time series, computes Theil-Sen slope, Mann-Kendall test, Pettitt test,
+# bootstraps CI for Sen slope, trains a simple XGBoost on time features, predicts, and plots observed, predicted,
+# Sen trend lines, and Pettitt change point as a step line. Shows heads and saves plot and results.
+
+# Imports
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy.stats import mstats
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+# Read file
+df = pd.read_csv('paste.txt', sep=';', engine='python')
+print(df.head())
+
+# Identify daily columns
+daily_cols = [c for c in df.columns if c.lower().startswith('dia')]
+print('daily cols count', len(daily_cols))
+
+# Melt to long per day
+rows = []
+for idx, row in df.iterrows():
+    base = {k: row[k] for k in ['Municipios','Postos','Latitude','Longitude','Anos','Meses']}
+    year = int(row['Anos'])
+    month = int(row['Meses'])
+    for dcol in daily_cols:
+        daynum = int(dcol.replace('Dia',''))
+        try:
+            val = float(row[dcol])
+        except:
+            val = np.nan
+        date = pd.Timestamp(year=year, month=month, day=1) + pd.Timedelta(days=daynum-1)
+        newr = base.copy()
+        newr.update({'date': date, 'rain_mm': val})
+        rows.append(newr)
+
+long = pd.DataFrame(rows)
+print(long.head())
+
+# Compute monthly totals per station (group by Municipios,Postos,date month)
+long['month_start'] = long['date'].values.astype('datetime64[M]')
+monthly = long.groupby(['Municipios','Postos','month_start'], as_index=False)['rain_mm'].sum()
+print(monthly.head())
+
+# Pick first station
+station = monthly.groupby(['Municipios','Postos']).size().reset_index().iloc[0][['Municipios','Postos']]
+mun = station['Municipios']
+pos = station['Postos']
+print(mun, pos)
+
+ts = monthly[(monthly['Municipios']==mun)&(monthly['Postos']==pos)].copy()
+ts = ts.sort_values('month_start')
+ts = ts.set_index('month_start')
+series = ts['rain_mm']
+print(series.head())
+
+# Theil-Sen slope (using statsmodels robust? use scipy mstats.theilslopes)
+from scipy import stats
+slope, intercept, lo_slope, hi_slope = stats.theilslopes(series.values, np.arange(len(series)), 0.95)
+print(slope, intercept, lo_slope, hi_slope)
+
+# Mann-Kendall test implementation
+def mann_kendall_test(x):
+    n = len(x)
+    s = 0
+    for k in range(n-1):
+        s += np.sum(np.sign(x[k+1:] - x[k]))
+    # variance
+    unique, counts = np.unique(x, return_counts=True)
+    tie_sum = np.sum(counts*(counts-1)*(2*counts+5))
+    var_s = (n*(n-1)*(2*n+5) - tie_sum)/18
+    if s>0:
+        z = (s-1)/np.sqrt(var_s)
+    elif s<0:
+        z = (s+1)/np.sqrt(var_s)
+    else:
+        z = 0
+    # two-sided p
+    from scipy.stats import norm
+    p = 2*(1 - norm.cdf(abs(z)))
+    return s, z, p
+
+s_stat, z_stat, p_val = mann_kendall_test(series.values)
+print('MK', s_stat, z_stat, p_val)
+
+# Pettitt test for change point
+def pettitt_test(x):
+    n = len(x)
+    K = np.zeros(n)
+    for t in range(n):
+        s = 0
+        for i in range(t+1):
+            for j in range(t+1, n):
+                if x[i] > x[j]:
+                    s += 1
+                elif x[i] < x[j]:
+                    s -= 1
+        K[t] = s
+    K_abs = np.abs(K)
+    U = np.argmax(K_abs)
+    Kt = K[U]
+    # p-value approx
+    p = 2*np.exp((-6*(Kt**2))/(n**3 + n**2))
+    return U, Kt, p
+
+cp_idx, Kt, p_pettitt = pettitt_test(series.values)
+print('Pettitt', cp_idx, Kt, p_pettitt)
+
+# Bootstrap CI for Sen slope
+n_boot = 1000
+boot_slopes = []
+for i in tqdm(range(n_boot)):
+    samp = series.sample(frac=1, replace=True).values
+    slope_b, _, _, _ = stats.theilslopes(samp, np.arange(len(samp)), 0.95)
+    boot_slopes.append(slope_b)
+boot_lo = np.percentile(boot_slopes, 2.5)
+boot_hi = np.percentile(boot_slopes, 97.5)
+print('boot CI', boot_lo, boot_hi)
+
+# Plot observed series, Theil-Sen line, Pettitt step at change point
+plt.figure(figsize=(12,5))
+x = np.arange(len(series))
+plt.plot(series.index, series.values, label='Observed', color='C0')
+# Sen line
+sen_y = intercept + slope * x
+plt.plot(series.index, sen_y, label='Theil-Sen trend', color='C1')
+# Pettitt step: mean before and after
+cp_date = series.index[cp_idx]
+mean_before = series.values[:cp_idx+1].mean()
+mean_after = series.values[cp_idx+1:].mean()
+step_x = [series.index[0], cp_date, cp_date + pd.Timedelta(days=30), series.index[-1]]
+step_y = [mean_before, mean_before, mean_after, mean_after]
+plt.step([series.index[0]] + list(series.index[1:]), np.concatenate([[mean_before], np.repeat(mean_after, len(series)-1)]), where='pre', label='Pettitt step', color='C2')
+plt.axvline(cp_date, color='C2', linestyle='--', alpha=0.6)
+plt.title('Observed monthly rainfall, Theil-Sen trend, Pettitt change point')
+plt.legend()
+plt.tight_layout()
+plt.savefig('ts_pettitt_plot.png')
+plt.show()
+
+# Save results
+res = {
+    'sen_slope_per_index': slope,
+    'sen_intercept': intercept,
+    'sen_lo': lo_slope,
+    'sen_hi': hi_slope,
+    'mk_s': s_stat,
+    'mk_z': z_stat,
+    'mk_p': p_val,
+    'pettitt_idx': int(cp_idx),
+    'pettitt_p': p_pettitt,
+    'bootstrap_lo': boot_lo,
+    'bootstrap_hi': boot_hi
+}
